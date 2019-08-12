@@ -51,8 +51,25 @@
 #pragma clang diagnostic pop
 #include "VoodooPS2Controller.h"
 #include "VoodooPS2SynapticsTouchPad.h"
-#include "Multitouch Support/VoodooPS2DigitiserTransducer.hpp"
+#include "../VoodooInput/VoodooInput/VoodooInputMultitouch/VoodooInputTransducer.h"
+#include "../VoodooInput/VoodooInput/VoodooInputMultitouch/VoodooInputMessages.h"
 
+
+#define kIOFBTransformKey               "IOFBTransform"
+
+enum {
+    // transforms
+    kIOFBRotateFlags                    = 0x0000000f,
+
+    kIOFBSwapAxes                       = 0x00000001,
+    kIOFBInvertX                        = 0x00000002,
+    kIOFBInvertY                        = 0x00000004,
+
+    kIOFBRotate0                        = 0x00000000,
+    kIOFBRotate90                       = kIOFBSwapAxes | kIOFBInvertX,
+    kIOFBRotate180                      = kIOFBInvertX  | kIOFBInvertY,
+    kIOFBRotate270                      = kIOFBSwapAxes | kIOFBInvertY
+};
 
 // =============================================================================
 // ApplePS2SynapticsTouchPad Class Implementation
@@ -82,17 +99,8 @@ bool ApplePS2SynapticsTouchPad::init(OSDictionary * dict)
     
     if (!super::init(dict))
         return false;
-    
-    transducers = OSArray::withCapacity(SYNAPTICS_MAX_FINGERS);
-    if (!transducers) {
-        return false;
-    }
-    DigitiserTransducerType type = kDigitiserTransducerFinger;
-    for (int i = 0; i < SYNAPTICS_MAX_FINGERS; i++) {
-        VoodooPS2DigitiserTransducer* transducer = VoodooPS2DigitiserTransducer::transducer(type, NULL);
-        transducers->setObject(transducer);
-		transducer->release();
-    }
+
+    memset(&inputEvent, 0, sizeof(VoodooInputEvent));
 
     // initialize state...
     _device = NULL;
@@ -477,11 +485,9 @@ void ApplePS2SynapticsTouchPad::queryCapabilities()
     }
     if (reportsMax && getTouchPadData(0xd, buf3))
     {
-        if(mt_interface) {
-            mt_interface->logical_max_x = (buf3[0] << 5) | ((buf3[1] & 0x0f) << 1);
-            mt_interface->logical_max_y = (buf3[2] << 5) | ((buf3[1] & 0xf0) >> 3);
-        }
-        
+        logical_max_x = (buf3[0] << 5) | ((buf3[1] & 0x0f) << 1);
+        logical_max_y = (buf3[2] << 5) | ((buf3[1] & 0xf0) >> 3);
+
         INFO_LOG("VoodooPS2Trackpad: Maximum coords($0D) bytes = { 0x%x, 0x%x, 0x%x }\n", buf3[0], buf3[1], buf3[2]);
     }
     if (deluxeLeds && getTouchPadData(0xe, buf3))
@@ -495,91 +501,66 @@ void ApplePS2SynapticsTouchPad::queryCapabilities()
 
     if (reportsMin && getTouchPadData(0xf, buf3))
     {
-        if(mt_interface) {
-            mt_interface->logical_min_x = (buf3[0] << 5) | ((buf3[1] & 0x0f) << 1);
-            mt_interface->logical_min_y = (buf3[2] << 5) | ((buf3[1] & 0xf0) >> 3);
-        }
+        logical_min_x = (buf3[0] << 5) | ((buf3[1] & 0x0f) << 1);
+        logical_min_y = (buf3[2] << 5) | ((buf3[1] & 0xf0) >> 3);
         DEBUG_LOG("VoodooPS2Trackpad: Minimum coords bytes($0F) = { 0x%x, 0x%x, 0x%x }\n", buf3[0], buf3[1], buf3[2]);
     }
     else {
-        if (mt_interface) {
-            mt_interface->logical_min_x = mt_interface->logical_max_x - 3 * margin_size_x;
-            mt_interface->logical_min_y = mt_interface->logical_max_y - 3 * margin_size_y;
-        }
+        logical_min_x = logical_max_x - 3 * margin_size_x;
+        logical_min_y = logical_max_y - 3 * margin_size_y;
     }
 
     // We should set physical dimensions anyway
-    if (mt_interface) {
-		mt_interface->logical_min_x += margin_size_x;
-		mt_interface->logical_min_y += margin_size_y;
-		mt_interface->logical_max_x -= margin_size_x;
-		mt_interface->logical_max_y -= margin_size_y;
+    logical_min_x += margin_size_x;
+    logical_min_y += margin_size_y;
+    logical_max_x -= margin_size_x;
+    logical_max_y -= margin_size_y;
 
-		if (minXOverride != -1)
-            mt_interface->logical_min_x = minXOverride;
-        if (minYOverride != -1)
-            mt_interface->logical_min_y = minYOverride;
-        if (maxXOverride != -1)
-            mt_interface->logical_max_x = maxXOverride;
-        if (maxYOverride != -1)
-            mt_interface->logical_max_y = maxYOverride;
+    if (minXOverride != -1)
+        logical_min_x = minXOverride;
+    if (minYOverride != -1)
+        logical_min_y = minYOverride;
+    if (maxXOverride != -1)
+        logical_max_x = maxXOverride;
+    if (maxYOverride != -1)
+        logical_max_y = maxYOverride;
 
-        setProperty("Min X", mt_interface->logical_min_x);
-        setProperty("Min Y", mt_interface->logical_min_y);
-        
-        setProperty("Max X", mt_interface->logical_max_x);
-        setProperty("Max Y", mt_interface->logical_max_y);
+    setProperty(VOODOO_INPUT_LOGICAL_MAX_X_KEY, logical_max_x - logical_min_x, 32);
+    setProperty(VOODOO_INPUT_LOGICAL_MAX_Y_KEY, logical_max_y - logical_min_y, 32);
 
-        // physical dimensions are specified in 0.01 mm units
-        mt_interface->physical_max_x = (mt_interface->logical_max_x + 1 - (reportsMin ? mt_interface->logical_min_x : 0)) * 100 / xupmm;
-        mt_interface->physical_max_y = (mt_interface->logical_max_y + 1 - (reportsMin ? mt_interface->logical_min_y : 0)) * 100 / yupmm;
-        
-        INFO_LOG("VoodooPS2Trackpad: logical %dx%d-%dx%d physical_max %dx%d upmm %dx%d",
-              mt_interface->logical_min_x, mt_interface->logical_min_y,
-              mt_interface->logical_max_x, mt_interface->logical_max_y,
-              mt_interface->physical_max_x, mt_interface->physical_max_y,
-              xupmm, yupmm);
-    }
+    // physical dimensions are specified in 0.01 mm units
+    physical_max_x = (logical_max_x + 1 - (reportsMin ? logical_min_x : 0)) * 100 / xupmm;
+    physical_max_y = (logical_max_y + 1 - (reportsMin ? logical_min_y : 0)) * 100 / yupmm;
+
+    setProperty(VOODOO_INPUT_PHYSICAL_MAX_X_KEY, physical_max_x, 32);
+    setProperty(VOODOO_INPUT_PHYSICAL_MAX_Y_KEY, physical_max_y, 32);
+
+    setProperty(kIOFBTransformKey, 0ull, 32);
+    setProperty("VoodooInputSupported", kOSBooleanTrue);
+
+    registerService();
+
+    INFO_LOG("VoodooPS2Trackpad: logical %dx%d-%dx%d physical_max %dx%d upmm %dx%d",
+          logical_min_x, logical_min_y,
+          logical_max_x, logical_max_y,
+          physical_max_x, physical_max_y,
+          xupmm, yupmm);
 }
 
-bool ApplePS2SynapticsTouchPad::publish_multitouch_interface() {
-    mt_interface = new VoodooPS2MultitouchInterface();
-    if (!mt_interface) {
-        DEBUG_LOG("VoodooPS2Trackpad No memory to allocate VoodooI2CMultitouchInterface instance\n");
-        goto multitouch_exit;
-    }
-    if (!mt_interface->init(NULL)) {
-        DEBUG_LOG("VoodooPS2Trackpad Failed to init multitouch interface\n");
-        goto multitouch_exit;
-    }
-    if (!mt_interface->attach(this)) {
-        DEBUG_LOG("VoodooPS2Trackpad Failed to attach multitouch interface\n");
-        goto multitouch_exit;
-    }
-    if (!mt_interface->start(this)) {
-        DEBUG_LOG("VoodooPS2Trackpad Failed to start multitouch interface\n");
-        goto multitouch_exit;
-    }
-    // Assume we are a touchpad
-    mt_interface->setProperty(kIOHIDDisplayIntegratedKey, false);
-    // 0x04f3 is Elan's Vendor Id
-    mt_interface->setProperty(kIOHIDVendorIDKey, 0x04f3, 32);
-    mt_interface->setProperty(kIOHIDProductIDKey, 0x01, 32);
+bool ApplePS2SynapticsTouchPad::handleOpen(IOService *forClient, IOOptionBits options, void *arg) {
+    if (forClient && forClient->getProperty(VOODOO_INPUT_IDENTIFIER)) {
+        voodooInputInstance = forClient;
+        voodooInputInstance->retain();
 
-    
-    return true;
-multitouch_exit:
-    unpublish_multitouch_interface();
-    return false;
+        return true;
+    }
+
+    return super::handleOpen(forClient, options, arg);
 }
 
-
-void ApplePS2SynapticsTouchPad::unpublish_multitouch_interface() {
-    if (mt_interface) {
-        mt_interface->stop(this);
-        // mt_interface->release();
-        // mt_interface = NULL;
-    }
+void ApplePS2SynapticsTouchPad::handleClose(IOService *forClient, IOOptionBits options) {
+    OSSafeReleaseNULL(voodooInputInstance);
+    super::handleClose(forClient, options);
 }
 
 bool ApplePS2SynapticsTouchPad::start( IOService * provider )
@@ -668,13 +649,9 @@ bool ApplePS2SynapticsTouchPad::start( IOService * provider )
         doHardwareReset();
     }
     
-    // Set up MT interface
-    publish_multitouch_interface();
-    
     //
     // Query the touchpad for the capabilities we need to know.
     //
-    
     queryCapabilities();
     
     //
@@ -722,11 +699,6 @@ bool ApplePS2SynapticsTouchPad::start( IOService * provider )
     // Update LED -- it could have been disabled then computer was restarted
     //
     updateTouchpadLED();
-    
-    if(mt_interface) {
-        mt_interface->registerService();
-    }
-    
     
     return true;
 }
@@ -810,12 +782,6 @@ void ApplePS2SynapticsTouchPad::stop( IOService * provider )
     //
     OSSafeReleaseNULL(_provider);
     
-    unpublish_multitouch_interface();
-    
-    if (transducers) {
-        OSSafeReleaseNULL(transducers);
-    }
-
 	super::stop(provider);
 }
 
@@ -1059,9 +1025,6 @@ static void clip(TValue& value, TLimit& minimum, TLimit& maximum, TMargin& margi
 }
 
 void ApplePS2SynapticsTouchPad::sendTouchData() {
-    if(!mt_interface)
-        return;
-    
     if (clampedFingerCount == 3 && lastFingerCount == 3) {
         // update third finger state
         if (fingerStates[0].virtualFingerIndex != -1 && fingerStates[1].virtualFingerIndex != -1) {
@@ -1073,15 +1036,15 @@ void ApplePS2SynapticsTouchPad::sendTouchData() {
             z = (fingerStates[0].z + fingerStates[1].z) / 2;
             w = (fingerStates[0].w + fingerStates[1].w) / 2;
 
-            if (x < mt_interface->logical_min_x)
-                x = mt_interface->logical_min_x;
-            else if (x > mt_interface->logical_max_x)
-                x = mt_interface->logical_max_x;
+            if (x < logical_min_x)
+                x = logical_min_x;
+            else if (x > logical_max_x)
+                x = logical_max_x;
             
-            if (y < mt_interface->logical_min_y)
-                y = mt_interface->logical_min_y;
-            else if (y > mt_interface->logical_max_y)
-                y = mt_interface->logical_max_y;
+            if (y < logical_min_y)
+                y = logical_min_y;
+            else if (y > logical_max_y)
+                y = logical_max_y;
         }
         else
             IOLog("synaptics_parse_hw_state: WTF - have 3 fingers, but first 2 don't have virtual finger");
@@ -1280,75 +1243,81 @@ void ApplePS2SynapticsTouchPad::sendTouchData() {
     if (timestamp_ns - keytime < maxaftertyping)
         return;
 
+    static_assert(VOODOO_INPUT_MAX_TRANSDUCERS >= SYNAPTICS_MAX_FINGERS, "Trackpad supports too many fingers");
+
     int transducers_count = 0;
     for(int i = 0; i < SYNAPTICS_MAX_FINGERS; i++) {
         virtual_finger_state *state = &virtualFingerStates[i];
         if (!state->touch)
             continue;
 
-        VoodooPS2DigitiserTransducer* transducer = OSDynamicCast(VoodooPS2DigitiserTransducer, transducers->getObject(transducers_count++));
+        VoodooInputTransducer* transducer = &inputEvent.transducers[transducers_count++];
         if(!transducer)
             continue;
         
-        transducer->type = kDigitiserTransducerFinger;
-        transducer->is_valid = true;
+        transducer->type = FINGER;
+        transducer->isValid = true;
         
         int posX = state->x_avg.average();
         int posY = state->y_avg.average();
 
-        clip(posX, mt_interface->logical_min_x, mt_interface->logical_max_x, margin_size_x);
-        clip(posY, mt_interface->logical_min_y, mt_interface->logical_max_y, margin_size_y);
+        clip(posX, logical_min_x, logical_max_x, margin_size_x);
+        clip(posY, logical_min_y, logical_max_y, margin_size_y);
 
-        posX -= mt_interface->logical_min_x;
-        posY = mt_interface->logical_max_y + 1 - posY;
+        posX -= logical_min_x;
+        posY = logical_max_y + 1 - posY;
         
         DEBUG_LOG("synaptics_parse_hw_state finger[%d] x=%d y=%d raw_x=%d raw_y=%d", i, posX, posY, state->x_avg.average(), state->y_avg.average());
-        
-        transducer->coordinates.x.update(posX, timestamp);
-        transducer->coordinates.y.update(posY, timestamp);
+
+        transducer->previousCoordinates.x = transducer->currentCoordinates.x;
+        transducer->previousCoordinates.y = transducer->currentCoordinates.y;
+        transducer->previousCoordinates.pressure = transducer->currentCoordinates.pressure;
+
+        transducer->currentCoordinates.x = posX;
+        transducer->currentCoordinates.y = posY;
+        transducer->timestamp = timestamp;
 
         switch (_forceTouchMode)
         {
             case FORCE_TOUCH_BUTTON: // Physical button is translated into force touch instead of click
-                transducer->physical_button.update(0, timestamp);
-                transducer->tip_pressure.update(state->button ? 255 : 0, timestamp);
+                transducer->isPhysicalButtonDown = false;
+                transducer->currentCoordinates.pressure = state->button ? 255 : 0;
                 break;
 
             case FORCE_TOUCH_THRESHOLD: // Force touch is touch with pressure over threshold
-                transducer->physical_button.update(state->button, timestamp);
-                transducer->tip_pressure.update(state->pressure > _forceTouchPressureThreshold ? 255 : 0, timestamp);
+                transducer->isPhysicalButtonDown = state->button;
+                transducer->currentCoordinates.pressure = state->pressure > _forceTouchPressureThreshold ? 255 : 0;
                 break;
 
             case FORCE_TOUCH_VALUE: // Pressure is passed to system as is
-                transducer->physical_button.update(state->button, timestamp);
-                transducer->tip_pressure.update(state->pressure, timestamp);
+                transducer->isPhysicalButtonDown = state->button;
+                transducer->currentCoordinates.pressure = state->pressure;
                 break;
 
             case FORCE_TOUCH_DISABLED:
             default:
-                transducer->physical_button.update(state->button, timestamp);
-                transducer->tip_pressure.update(0, timestamp);
+                transducer->isPhysicalButtonDown = state->button;
+                transducer->currentCoordinates.pressure = 0;
                 break;
 
         }
 
-        transducer->tip_switch.update(1, timestamp);
-        transducer->tip_width.update(state->pressure / 2, timestamp);
+        transducer->isTransducerActive = 1;
+        transducer->currentCoordinates.width = state->pressure / 2;
         transducer->id = i;
-        transducer->secondary_id = i;
+        transducer->secondaryId = i;
     }
     
     if (transducers_count != clampedFingerCount)
         IOLog("synaptics_parse_hw_state: WTF?! tducers_count %d clampedFingerCount %d", transducers_count, clampedFingerCount);
 
     // create new VoodooI2CMultitouchEvent
-    VoodooI2CMultitouchEvent event;
-    event.contact_count = transducers_count;
-    event.transducers = transducers;
+    inputEvent.contact_count = transducers_count;
+    inputEvent.timestamp = timestamp;
+
     // send the event into the multitouch interface
-    
-    mt_interface->handleInterruptReport(event, timestamp);
-    
+    super::messageClient(kIOMessageVoodooInputMessage, voodooInputInstance, &inputEvent, sizeof(VoodooInputEvent));
+
     lastFingerCount = clampedFingerCount;
 }
 
